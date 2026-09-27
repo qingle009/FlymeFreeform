@@ -118,6 +118,12 @@ internal class OutsideTapCloseHookInstaller(
                     }
                     result
                 }
+            if (!access.taskListResolved) {
+                module.log(Log.WARN, TAG, "OUTSIDE_TAP_TASK_LIST_UNAVAILABLE")
+            }
+            if (!access.imeAccessResolved) {
+                module.log(Log.WARN, TAG, "OUTSIDE_TAP_IME_WINDOW_UNAVAILABLE")
+            }
             module.log(Log.INFO, TAG, "OUTSIDE_TAP_INPUT_REGION_HOOK_INSTALLED")
         } catch (exception: ReflectiveOperationException) {
             module.log(Log.WARN, TAG, "OUTSIDE_TAP_TARGET_UNAVAILABLE", exception)
@@ -145,10 +151,21 @@ internal class OutsideTapCloseHookInstaller(
     ) {
         private val controllerField = listenerClass.requiredField("this$0")
         private val contextField = controllerClass.requiredField("mContext")
-        private val flexibleTasksField = controllerClass.requiredField("mFlexibleTasks")
+
+        // ColorOS 17 renamed mFlexibleTasks → mAllFlexibleTasks; treat absence as degradation.
+        private val flexibleTasksField =
+            controllerClass.optionalField("mFlexibleTasks", "mAllFlexibleTasks")
+
+        internal val taskListResolved: Boolean
+            get() = flexibleTasksField != null
+
+        // ColorOS 17 renamed mInputMethodWindow → mImeWindow (getImeWindow exists too).
+        private val imeWindowAccessor = buildImeWindowAccessor(displayContentClass)
+
+        internal val imeAccessResolved: Boolean
+            get() = imeWindowAccessor != null
         private val captionTaskField = captionClass.requiredField("mTask")
         private val captionControllerField = captionClass.requiredField("mFlexibleTaskController")
-        private val inputMethodWindowField = displayContentClass.requiredField("mInputMethodWindow")
         private val updateCaptionTouchRegion = captionClass.requiredMethod("updateTouchRegion", 0)
         private val getTopZoomTask = controllerClass.requiredMethod("getTopZoomTask", 0)
         private val isCanRespondEvent = controllerClass.requiredMethod("isCanRespondEvent", 0)
@@ -316,7 +333,7 @@ internal class OutsideTapCloseHookInstaller(
             synchronized(protectedTasks) { protectedTasks.containsKey(task) }
 
         private fun allFlexibleTaskBounds(controller: Any): List<Rect> {
-            val tasks = flexibleTasksField.get(controller) ?: return emptyList()
+            val tasks = flexibleTasksField?.get(controller) ?: return emptyList()
             val taskSnapshot =
                 synchronized(tasks) {
                     (tasks as? Iterable<*>)?.filterNotNull()?.toList().orEmpty()
@@ -329,7 +346,7 @@ internal class OutsideTapCloseHookInstaller(
         }
 
         private fun visibleImeRegion(displayContent: Any): Region? {
-            val imeWindow = inputMethodWindowField.get(displayContent) ?: return null
+            val imeWindow = imeWindowAccessor?.invoke(displayContent) ?: return null
             if (isWindowVisible.invokeUnwrapped(imeWindow) != true) return null
             return Region().also { getTouchableRegion.invokeUnwrapped(imeWindow, it) }
         }
@@ -522,11 +539,23 @@ internal class OutsideTapCloseHookInstaller(
         }
 
         private fun isInsideVisibleIme(displayContent: Any, x: Int, y: Int): Boolean {
-            val imeWindow = inputMethodWindowField.get(displayContent) ?: return false
+            val imeWindow = imeWindowAccessor?.invoke(displayContent) ?: return false
             if (isWindowVisible.invokeUnwrapped(imeWindow) != true) return false
             val touchRegion = Region()
             getTouchableRegion.invokeUnwrapped(imeWindow, touchRegion)
             return touchRegion.contains(x, y)
+        }
+
+        private fun buildImeWindowAccessor(displayContentClass: Class<*>): ((Any) -> Any?)? {
+            displayContentClass.optionalField("mImeWindow", "mInputMethodWindow")?.let { field ->
+                return { displayContent -> field.get(displayContent) }
+            }
+            val getImeWindow = try {
+                displayContentClass.requiredMethod("getImeWindow", 0)
+            } catch (_: NoSuchMethodException) {
+                return null
+            }
+            return { displayContent -> getImeWindow.invokeUnwrapped(displayContent) }
         }
 
         private fun viewConfiguration(controller: Any): ViewConfiguration {
@@ -571,6 +600,16 @@ private fun Class<*>.requiredField(name: String): Field {
         }
     }
     throw NoSuchFieldException(name)
+}
+
+private fun Class<*>.optionalField(vararg names: String): Field? {
+    for (name in names) {
+        try {
+            return requiredField(name)
+        } catch (_: NoSuchFieldException) {
+        }
+    }
+    return null
 }
 
 private fun Class<*>.requiredMethod(name: String, parameterCount: Int): Method {
